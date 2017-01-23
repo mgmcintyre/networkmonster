@@ -3,8 +3,9 @@ package main
 import (
 	"log"
 	"net"
+	"os"
 
-	"github.com/mgmcintyre/go-playground/networkmonster"
+	"github.com/mgmcintyre/networkmonster"
 )
 
 func main() {
@@ -14,15 +15,23 @@ func main() {
 	}
 	defer nm.Close()
 
-	dstip := net.IP{10, 10, 51, 89}
-	// dstip := net.IP{8, 8, 4, 4}
-	log.Printf("Attempting to arp %s", dstip)
+	dstip := net.ParseIP(os.Args[1])
+	if dstip == nil {
+		log.Fatal("Invalid IP address provided")
+	}
+
+	dstip4 := dstip.To4()
+	if dstip4 == nil {
+		log.Fatal("Only IPv4 addresses accepted")
+	}
+
+	log.Printf("Attempting to arp %s", dstip4)
 
 	// ARP
-	dstaddr, err := nm.ARP(dstip)
+	dstaddr, err := nm.ARP(dstip4)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	log.Printf("IP %s is at %s", dstip, dstaddr)
+	log.Printf("IP %s is at %s", dstip4, dstaddr)
 }
