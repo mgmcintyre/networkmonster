@@ -15,7 +15,7 @@ You'll need privileged access to create raw sockets:
 ```
 $ sudo GOPATH=/path/to/go go run examples/ping/ping.go 192.168.0.100
 OR
-$ go build examples/ping/ping.go && ./ping 10.32.0.134
+$ go build examples/ping/ping.go && sudo ./ping 10.32.0.134
 ```
 
 ## What next
