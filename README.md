@@ -18,8 +18,12 @@ OR
 $ go build examples/ping/ping.go && sudo ./ping 10.32.0.134
 ```
 
+## Note on Layer 2 OS translation
+This code will run whether you're connected via ethernet or Wi-Fi.
+Your host OS (or the network driver, I'm not really sure which) translates your
+Ethernet frames to 802.11 before they are sent over your Wi-Fi connection.
+
 ## What next
-+ LLDP
 + Emulate standard `ping` behaviour
 + Default gateway for interface
 + Routing tables (for ARP)

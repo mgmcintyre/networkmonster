@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/google/gopacket"
@@ -15,9 +16,15 @@ import (
 
 // NetworkMonster provides basic networking functionality using raw sockets
 type NetworkMonster struct {
-	handle *pcap.Handle
-	iface  *net.Interface
-	srcip  net.IP
+	handle        *pcap.Handle
+	iface         *net.Interface
+	srcip         net.IP
+	packetReaders packetReaderList
+}
+
+type packetReaderList struct {
+	sync.Mutex
+	members []chan gopacket.Packet
 }
 
 func getSourceIP(iface *net.Interface) net.IP {
@@ -38,10 +45,10 @@ func getSourceIP(iface *net.Interface) net.IP {
 	return nil
 }
 
-func writeARP(handle *pcap.Handle, iface *net.Interface, srcip net.IP, dstip net.IP) error {
+func (nm *NetworkMonster) writeARP(dstip net.IP) error {
 	// Set up all the layers' fields we can.
 	eth := layers.Ethernet{
-		SrcMAC:       iface.HardwareAddr,
+		SrcMAC:       nm.iface.HardwareAddr,
 		DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
 		EthernetType: layers.EthernetTypeARP,
 	}
@@ -52,8 +59,8 @@ func writeARP(handle *pcap.Handle, iface *net.Interface, srcip net.IP, dstip net
 		HwAddressSize:     6,
 		ProtAddressSize:   4,
 		Operation:         layers.ARPRequest,
-		SourceHwAddress:   []byte(iface.HardwareAddr),
-		SourceProtAddress: []byte(srcip),
+		SourceHwAddress:   []byte(nm.iface.HardwareAddr),
+		SourceProtAddress: []byte(nm.srcip),
 		DstHwAddress:      []byte{0, 0, 0, 0, 0, 0},
 		DstProtAddress:    []byte(dstip),
 	}
@@ -69,26 +76,19 @@ func writeARP(handle *pcap.Handle, iface *net.Interface, srcip net.IP, dstip net
 		return err
 	}
 
-	if err := handle.WritePacketData(buf.Bytes()); err != nil {
+	if err := nm.handle.WritePacketData(buf.Bytes()); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func readARP(handle *pcap.Handle, iface *net.Interface, dstip net.IP) chan net.HardwareAddr {
+func (nm *NetworkMonster) readARP(dstip net.IP) chan net.HardwareAddr {
 	out := make(chan net.HardwareAddr, 1)
 
 	go func() {
-		src := gopacket.NewPacketSource(handle, layers.LinkTypeEthernet)
-		for {
-			packet, err := src.NextPacket()
-			if err == io.EOF {
-				break
-			} else if err != nil {
-				log.Println("Error:", err)
-				continue
-			}
+		packets, done := nm.readPackets()
+		for packet := range packets {
 			arpLayer := packet.Layer(layers.LayerTypeARP)
 			if arpLayer == nil {
 				continue
@@ -96,6 +96,7 @@ func readARP(handle *pcap.Handle, iface *net.Interface, dstip net.IP) chan net.H
 			arp := arpLayer.(*layers.ARP)
 
 			if arp.Operation == layers.ARPReply && bytes.Equal([]byte(dstip), arp.SourceProtAddress) {
+				done <- struct{}{}
 				out <- net.HardwareAddr(arp.SourceHwAddress)
 				break
 			}
@@ -108,14 +109,13 @@ func readARP(handle *pcap.Handle, iface *net.Interface, dstip net.IP) chan net.H
 // ARP sends an ARP request for the given IP address
 func (nm *NetworkMonster) ARP(dstip net.IP) (net.HardwareAddr, error) {
 	log.Print("Listening for ARP reply")
-	arpreply := readARP(nm.handle, nm.iface, dstip)
+	arpreply := nm.readARP(dstip)
 
 	log.Printf("Making ARP request for %s", dstip)
-	if err := writeARP(nm.handle, nm.iface, nm.srcip, dstip); err != nil {
+	if err := nm.writeARP(dstip); err != nil {
 		return nil, err
 	}
 
-	log.Printf("Waiting for ARP reply")
 	var dstaddr net.HardwareAddr
 	select {
 	case <-time.After(5000 * time.Millisecond):
@@ -174,15 +174,8 @@ func (nm *NetworkMonster) readPing(dstip net.IP) chan struct{} {
 	out := make(chan struct{}, 1)
 
 	go func() {
-		src := gopacket.NewPacketSource(nm.handle, layers.LinkTypeEthernet)
-		for {
-			packet, err := src.NextPacket()
-			if err == io.EOF {
-				break
-			} else if err != nil {
-				log.Println("Error:", err)
-				continue
-			}
+		packets, done := nm.readPackets()
+		for packet := range packets {
 			icmpLayer := packet.Layer(layers.LayerTypeICMPv4)
 			if icmpLayer == nil {
 				continue
@@ -190,6 +183,7 @@ func (nm *NetworkMonster) readPing(dstip net.IP) chan struct{} {
 			icmp := icmpLayer.(*layers.ICMPv4)
 
 			if icmp.TypeCode == layers.ICMPv4TypeEchoReply {
+				done <- struct{}{}
 				out <- struct{}{}
 				break
 			}
@@ -216,7 +210,6 @@ func (nm *NetworkMonster) PingOnce(dstip net.IP) (*time.Duration, error) {
 		log.Fatal(err)
 	}
 
-	log.Printf("Waiting for ping reply")
 	select {
 	case <-time.After(5000 * time.Millisecond):
 		return nil, errors.New("No ping reply received")
@@ -245,6 +238,58 @@ func getInterface(name string) (*net.Interface, error) {
 // Close tidies up the open socket
 func (nm *NetworkMonster) Close() {
 	nm.handle.Close()
+}
+
+func (nm *NetworkMonster) readPackets() (chan gopacket.Packet, chan struct{}) {
+	out := make(chan gopacket.Packet)
+	done := make(chan struct{}, 1)
+
+	// Lock to add the outbound channel & set up done channel handler
+	nm.packetReaders.Lock()
+
+	// Add out channel to packet readers list & note the index
+	nm.packetReaders.members = append(nm.packetReaders.members, out)
+	i := len(nm.packetReaders.members) - 1
+
+	// Wait for the done channel in the background to remove the out channel
+	go func() {
+		<-done
+		nm.packetReaders.Lock()
+		l := len(nm.packetReaders.members)
+		nm.packetReaders.members[l-1] = nm.packetReaders.members[i]
+		nm.packetReaders.members[i] = nm.packetReaders.members[l-1]
+		nm.packetReaders.members = nm.packetReaders.members[:l-1]
+		nm.packetReaders.Unlock()
+	}()
+
+	nm.packetReaders.Unlock()
+
+	// If we added the first packet reader then we're starting or restarting
+	if i == 0 {
+		go func() {
+			src := gopacket.NewPacketSource(nm.handle, layers.LinkTypeEthernet)
+			for {
+				packet, err := src.NextPacket()
+				if err == io.EOF {
+					break
+				} else if err != nil {
+					log.Println("Error:", err)
+					continue
+				}
+				nm.packetReaders.Lock()
+				if len(nm.packetReaders.members) > 0 {
+					for _, reader := range nm.packetReaders.members {
+						reader <- packet
+					}
+				} else {
+					break
+				}
+				nm.packetReaders.Unlock()
+			}
+		}()
+	}
+
+	return out, done
 }
 
 // NewNetworkMonster builds a NetworkMonster for the given interface
